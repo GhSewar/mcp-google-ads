@@ -6,7 +6,6 @@ import requests
 from pathlib import Path
 
 from google.oauth2.credentials import Credentials
-from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 import logging
@@ -25,7 +24,8 @@ mcp = FastMCP(
         "google-auth",
         "requests",
         "python-dotenv"
-    ]
+    ],
+    streamable_http_path="/google-ads-mcp"
 )
 
 # Constants and configuration
@@ -48,34 +48,8 @@ CLIENT_SECRET_HEADER = "google-ads-client-secret"
 DEVELOPER_TOKEN_HEADER = "google-ads-developer-token"
 
 # Get credentials from environment variables / secrets
-GOOGLE_ADS_CREDENTIALS_PATH = os.environ.get("GOOGLE_ADS_CREDENTIALS_PATH")
-SECRETS_ROOT = Path("/var/secrets")
 
-
-def _read_secret_value(secret_name: str) -> Optional[str]:
-    """Read a secret from /var/secrets, with env var fallback."""
-    secret_path = SECRETS_ROOT / secret_name
-    try:
-        if secret_path.exists():
-            value = secret_path.read_text(encoding="utf-8").strip()
-            if value:
-                return value
-    except Exception as exc:
-        logger.warning("Failed to read secret %s at %s: %s", secret_name, secret_path, exc)
-
-    env_value = os.environ.get(secret_name)
-    if env_value:
-        return env_value.strip()
-
-    env_value = os.environ.get(secret_name.upper())
-    if env_value:
-        return env_value.strip()
-
-    return None
-
-
-GOOGLE_ADS_LOGIN_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "")
-GOOGLE_ADS_AUTH_TYPE = os.environ.get("GOOGLE_ADS_AUTH_TYPE", "oauth")  # oauth or service_account
+GOOGLE_ADS_AUTH_TYPE = os.environ.get("GOOGLE_ADS_AUTH_TYPE", "oauth")
 
 def _get_app_credentials() -> tuple[str, str]:
     """Load Google Ads app credentials from MCP request headers."""
@@ -142,52 +116,13 @@ def format_customer_id(customer_id: str) -> str:
     return customer_id.zfill(10)
 
 def get_credentials():
-    """
-    Get and refresh OAuth credentials or service account credentials based on the auth type.
-    This function supports two authentication methods:
-    1. OAuth 2.0 (User Authentication) - For individual users or desktop applications
-    2. Service Account (Server-to-Server Authentication) - For automated systems
-
-    Returns:
-        Valid credentials object to use with Google Ads API
-    """
+    """Fetch refreshed OAuth credentials using headers supplied with the MCP request."""
     auth_type = GOOGLE_ADS_AUTH_TYPE.lower()
-    logger.info(f"Using authentication type: {auth_type}")
-    # Service Account authentication
-    if auth_type == "service_account":
-        if not GOOGLE_ADS_CREDENTIALS_PATH:
-            raise ValueError("GOOGLE_ADS_CREDENTIALS_PATH environment variable not set for service account auth")
-        try:
-            return get_service_account_credentials()
-        except Exception as e:
-            logger.error(f"Error with service account authentication: {str(e)}")
-            raise
-    # OAuth 2.0 authentication (default)
+    if auth_type != "oauth":
+        logger.warning("Unsupported GOOGLE_ADS_AUTH_TYPE '%s'; defaulting to OAuth", auth_type)
+
     refresh_token = _require_refresh_token_from_request()
     return get_oauth_credentials(refresh_token=refresh_token)
-
-def get_service_account_credentials():
-    """Get credentials using a service account key file."""
-    logger.info(f"Loading service account credentials from {GOOGLE_ADS_CREDENTIALS_PATH}")
-
-    if not os.path.exists(GOOGLE_ADS_CREDENTIALS_PATH):
-        raise FileNotFoundError(f"Service account key file not found at {GOOGLE_ADS_CREDENTIALS_PATH}")
-
-    try:
-        credentials = service_account.Credentials.from_service_account_file(
-            GOOGLE_ADS_CREDENTIALS_PATH,
-            scopes=SCOPES
-        )
-
-        # Check if impersonation is required
-        impersonation_email = os.environ.get("GOOGLE_ADS_IMPERSONATION_EMAIL")
-        if impersonation_email:
-            logger.info(f"Impersonating user: {impersonation_email}")
-            credentials = credentials.with_subject(impersonation_email)
-        return credentials
-    except Exception as e:
-        logger.error(f"Error loading service account credentials: {str(e)}")
-        raise
 
 def get_oauth_credentials(refresh_token: str):
     """Refresh OAuth user credentials using the provided refresh token."""
@@ -216,35 +151,27 @@ def get_headers(creds):
     """Get headers for Google Ads API requests."""
     developer_token = _get_developer_token()
     # Handle different credential types
-    if isinstance(creds, service_account.Credentials):
-        # For service account, we need to get a new bearer token
-        auth_req = Request()
-        creds.refresh(auth_req)
-        token = creds.token
-    else:
-        # For OAuth credentials, check if token needs refresh
-        if not creds.valid:
-            if creds.expired and creds.refresh_token:
-                try:
-                    logger.info("Refreshing expired OAuth token in get_headers")
-                    creds.refresh(Request())
-                    logger.info("Token successfully refreshed in get_headers")
-                except RefreshError as e:
-                    logger.error(f"Error refreshing token in get_headers: {str(e)}")
-                    raise ValueError(f"Failed to refresh OAuth token: {str(e)}")
-                except Exception as e:
-                    logger.error(f"Unexpected error refreshing token in get_headers: {str(e)}")
-                    raise
-            else:
-                raise ValueError("OAuth credentials are invalid and cannot be refreshed")
-        token = creds.token
+    # Refresh expired tokens as needed while assuming OAuth credentials
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
+            try:
+                logger.info("Refreshing expired OAuth token in get_headers")
+                creds.refresh(Request())
+                logger.info("Token successfully refreshed in get_headers")
+            except RefreshError as e:
+                logger.error(f"Error refreshing token in get_headers: {str(e)}")
+                raise ValueError(f"Failed to refresh OAuth token: {str(e)}")
+            except Exception as e:
+                logger.error(f"Unexpected error refreshing token in get_headers: {str(e)}")
+                raise
+        else:
+            raise ValueError("OAuth credentials are invalid and cannot be refreshed")
+    token = creds.token
     headers = {
         'Authorization': f'Bearer {token}',
         'developer-token': developer_token,
         'content-type': 'application/json'
     }
-    if GOOGLE_ADS_LOGIN_CUSTOMER_ID:
-        headers['login-customer-id'] = format_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
     return headers
 
 @mcp.tool()
