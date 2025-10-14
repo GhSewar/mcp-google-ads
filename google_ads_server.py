@@ -1,4 +1,5 @@
-from typing import Optional, Mapping
+from datetime import date, timedelta
+from typing import Mapping
 from pydantic import Field
 import os
 import json
@@ -174,6 +175,49 @@ def get_headers(creds):
     }
     return headers
 
+
+def _extract_account_name(query_output: str) -> str:
+    """Pull the descriptive name from the GAQL table output."""
+    if query_output.startswith("Error"):
+        raise ValueError(query_output)
+
+    lines = [line.strip() for line in query_output.splitlines() if line.strip()]
+    header_idx = None
+    for idx, line in enumerate(lines):
+        if line.startswith("Query Results"):
+            continue
+        if set(line) == {"-"}:
+            continue
+        header_idx = idx
+        break
+
+    if header_idx is None:
+        raise ValueError("Account name not found in GAQL output")
+
+    raw_header = lines[header_idx]
+    headers = [raw_header] if " | " not in raw_header else [col.strip() for col in raw_header.split("|")]
+
+    name_index = 0
+    for idx, header in enumerate(headers):
+        normalized = header.replace("_", "").replace(".", "").lower()
+        if "descriptivename" in normalized:
+            name_index = idx
+            break
+
+    for line in lines[header_idx + 1:]:
+        if set(line) == {"-"}:
+            continue
+        values = [line] if " | " not in line else [col.strip() for col in line.split("|")]
+        if name_index < len(values):
+            value = values[name_index].strip()
+            if value:
+                return value
+        if values and values[0].strip():
+            return values[0].strip()
+
+    raise ValueError("Account name not found in GAQL output")
+
+
 @mcp.tool()
 async def list_accounts() -> str:
     """
@@ -181,9 +225,10 @@ async def list_accounts() -> str:
     This is typically the first command you should run to identify which accounts
     you have access to. The returned account IDs can be used in subsequent commands.
     Returns:
-        A formatted list of all Google Ads accounts accessible with your credentials
+        A formatted list of all Google Ads accounts (ID and name) accessible with your credentials
     """
     try:
+        ACCOUNT_NAME_QUERY = "SELECT customer.descriptive_name FROM customer"
         creds = get_credentials()
         headers = get_headers(creds)
 
@@ -201,10 +246,25 @@ async def list_accounts() -> str:
         result_lines = ["Accessible Google Ads Accounts:"]
         result_lines.append("-" * 50)
 
+        account_name_errors = False
+
         for resource_name in customers['resourceNames']:
             customer_id = resource_name.split('/')[-1]
             formatted_id = format_customer_id(customer_id)
-            result_lines.append(f"Account ID: {formatted_id}")
+            try:
+                account_name_output = await execute_gaql_query(
+                    formatted_id,
+                    ACCOUNT_NAME_QUERY
+                )
+                account_name = _extract_account_name(account_name_output)
+            except Exception as exc:
+                logger.warning("Failed to load account name for %s: %s", formatted_id, exc)
+                account_name_errors = True
+                account_name = "Unavailable"
+            result_lines.append(f"Account ID: {formatted_id} | Name: {account_name}")
+
+        if account_name_errors:
+            result_lines.append("(Some account names could not be retrieved; see logs for details.)")
 
         return "\n".join(result_lines)
 
@@ -1195,14 +1255,17 @@ async def analyze_image_assets(
     # Make sure to use a valid date range format
     # Valid formats are: LAST_7_DAYS, LAST_14_DAYS, LAST_30_DAYS, etc. (with underscores)
     if days == 7:
-        date_range = "LAST_7_DAYS"
+        date_filter = "segments.date DURING LAST_7_DAYS"
     elif days == 14:
-        date_range = "LAST_14_DAYS"
+        date_filter = "segments.date DURING LAST_14_DAYS"
     elif days == 30:
-        date_range = "LAST_30_DAYS"
+        date_filter = "segments.date DURING LAST_30_DAYS"
     else:
-        # Default to 30 days if not a standard range
-        date_range = "LAST_30_DAYS"
+        # Custom range: end yesterday (to match LAST_N_DAYS semantics) and span `days`
+        end_date = date.today() - timedelta(days=1)
+        start_date = end_date - timedelta(days=days - 1)
+        date_filter = f"segments.date BETWEEN '{start_date:%Y-%m-%d}' AND '{end_date:%Y-%m-%d}'"
+
 
     query = f"""
         SELECT
@@ -1220,7 +1283,7 @@ async def analyze_image_assets(
             campaign_asset
         WHERE
             asset.type = 'IMAGE'
-            AND segments.date DURING LAST_30_DAYS
+            AND {date_filter}
         ORDER BY
             metrics.impressions DESC
         LIMIT 200
@@ -1320,35 +1383,53 @@ async def analyze_image_assets(
         return f"Error analyzing image assets: {str(e)}"
 
 @mcp.tool()
-async def list_resources(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'")
-) -> str:
+async def list_resources() -> str:
     """
     List valid resources that can be used in GAQL FROM clauses.
 
-    Args:
-        customer_id: The Google Ads customer ID as a string
+    This is a reference helper for building GAQL queries: it fetches the Google Ads
+    field catalog so agents can verify which top-level resources are legal targets
+    before composing a query or debugging errors.
 
     Returns:
-        Formatted list of valid resources
+        Formatted list of valid resources shared across Google Ads accounts.
     """
-    # Example query that lists some common resources
-    # This might need to be adjusted based on what's available in your API version
     query = """
-        SELECT
-            google_ads_field.name,
-            google_ads_field.category,
-            google_ads_field.data_type
-        FROM
-            google_ads_field
-        WHERE
-            google_ads_field.category = 'RESOURCE'
-        ORDER BY
-            google_ads_field.name
+        SELECT name, category, data_type
+        WHERE category = RESOURCE
+        ORDER BY name
     """
 
-    # Use your existing run_gaql function to execute this query
-    return await run_gaql(customer_id, query)
+    try:
+        creds = get_credentials()
+        headers = get_headers(creds)
+
+        url = f"https://googleads.googleapis.com/{API_VERSION}/googleAdsFields:search"
+        payload = {"query": query}
+        response = requests.post(url, headers=headers, json=payload)
+
+        if response.status_code != 200:
+            return f"Error listing resources: {response.text}"
+
+        data = response.json()
+        results = data.get("results", [])
+        if not results:
+            return "No resources returned by GoogleAdsFieldService."
+
+        lines = ["Available GAQL Resources:"]
+        lines.append("-" * 80)
+
+        for row in results:
+            field_obj = row.get("googleAdsField", row)
+            name = field_obj.get("name", "")
+            category = field_obj.get("category", "")
+            data_type = field_obj.get("dataType", field_obj.get("data_type", ""))
+            if name:
+                lines.append(f"{name} | category={category} | data_type={data_type}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error listing resources: {str(e)}"
 
 if __name__ == "__main__":
     # Start the MCP server on stdio transport
